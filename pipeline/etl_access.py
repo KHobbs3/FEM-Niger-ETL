@@ -1,0 +1,252 @@
+"""
+ETL: Health Access & Supply page
+Produces pre-aggregated CSVs — no PII in outputs.
+
+Output files (written to APP_DATA_DIR):
+  access_stockouts.csv       — stockout rates by split
+  access_stockout_responses.csv — stockout response value counts
+  access_travel.csv          — mean travel time + gap rate by split
+  access_affordability.csv   — mean costs by split
+  access_composite.csv       — composite barrier rates by use group
+"""
+
+import pandas as pd
+import numpy as np
+import os
+
+from pipeline.config import (
+    WEIGHT_COL, USER_GROUPS, NONUSER_GROUPS, WTT_MAP, APP_DATA_DIR, SPLIT_COLS
+)
+from pipeline.utils import (
+    weighted_prop, weighted_mean,
+    split_weighted_prop, split_weighted_mean,
+    save, load_raw
+)
+
+
+
+def run(df):
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    print("  [access] running...")
+
+    users    = df[df["use"].isin(USER_GROUPS)].copy()
+    nonusers = df[df["use"].isin(NONUSER_GROUPS)].copy()
+
+    # Map willingness to travel to minutes
+    if "willingness_to_travel" in df.columns:
+        df["wtt_minutes"] = df["willingness_to_travel"].map(WTT_MAP)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    # The survey uses bilingual strings, e.g.:
+    #   stockouts_users:              "Ee / Yes"  or  "A'a / No"
+    #   stockouts_nonusers:           "Ee / Oui"  or  "A'a / Non"
+    #   nonusers_seek_contraceptives: "Na gwada kuma na yi nasara / I tried and was successful"
+    #                                 "Na gwada amma ban yi nasara ba / I've tried but was unsuccessful"
+    #
+    # We match on the Hausa "Ee" (yes) for stockout flags and on the
+    # "successful" substring for the seeking question.
+
+    def _is_yes(series):
+        """True if the response indicates 'yes' / 'Ee' in bilingual stockout columns."""
+        s = series.astype(str).str.strip()
+        return s.str.startswith("Ee") | s.str.lower().str.contains(r"\byes\b", regex=True)
+
+    def _sought_successfully(series):
+        """
+        True if non-user tried AND succeeded in accessing contraceptives.
+        Positive value: "Na gwada kuma na yi nasara / I tried and was successful"
+        Negative/irrelevant: "Ban taba gwadawa ba", "Na gwada amma ban yi nasara ba", NaN
+        """
+        s = series.astype(str).str.lower()
+        return s.str.contains("na gwada kuma na yi nasara", na=False) | \
+               s.str.contains("tried and was successful", na=False)
+
+    def _sought_any(series):
+        """
+        True if non-user ever tried to access contraceptives (successful or not).
+        Excludes "never tried" and NaN.
+        """
+        s = series.astype(str).str.lower()
+        never = s.str.contains("ban taba gwadawa", na=False) | \
+                s.str.contains("never tried", na=False)
+        is_null = series.isna()
+        return ~never & ~is_null
+
+    # ── 1. Stockout rates ─────────────────────────────────────────────────────
+    rows = []
+
+    # Users who experienced a stockout
+    if "stockouts_users" in df.columns:
+        users["_su"] = _is_yes(users["stockouts_users"])
+        for split_col in SPLIT_COLS:
+            s = split_weighted_prop(users, "_su", split_col)
+            for grp, val in s.items():
+                rows.append({"metric": "stockout_users", "split": split_col,
+                             "group": grp, "value": val})
+
+    # Non-users: who sought contraceptives, and of those, who hit a stockout
+    if "nonusers_seek_contraceptives" in df.columns:
+        nonusers["_sought"] = _sought_any(nonusers["nonusers_seek_contraceptives"])
+        sought = nonusers[nonusers["_sought"]].copy()
+
+        if "stockouts_nonusers" in df.columns:
+            sought["_snu"] = _is_yes(sought["stockouts_nonusers"])
+            for split_col in SPLIT_COLS:
+                s = split_weighted_prop(sought, "_snu", split_col)
+                for grp, val in s.items():
+                    rows.append({"metric": "stockout_nonusers_sought", "split": split_col,
+                                 "group": grp, "value": val})
+
+        # Proportion of non-users who sought contraceptives (by split)
+        for split_col in SPLIT_COLS:
+            s = split_weighted_prop(nonusers, "_sought", split_col)
+            for grp, val in s.items():
+                rows.append({"metric": "sought_contraceptives", "split": split_col,
+                             "group": grp, "value": val})
+
+    save(pd.DataFrame(rows), os.path.join(APP_DATA_DIR, "access_stockouts.csv"),
+         "stockout rates")
+
+    # ── 2. Stockout responses (value counts, not weighted — qualitative) ──────
+    resp_rows = []
+    for col, other_col, label in [
+        ("stockouts_response",          "stockouts_response_other",          "users"),
+        ("stockouts_nonusers_response", "stockouts_nonusers_response_other", "nonusers"),
+    ]:
+        if col in df.columns:
+            subset = users if label == "users" else nonusers
+            combined = subset[col].copy()
+            # Handle "other" free-text (original code checked == -88 but values are strings)
+            if other_col in subset.columns:
+                mask = combined.astype(str).str.startswith("-88") | (combined == -88)
+                combined.loc[mask] = subset.loc[mask, other_col]
+            # Strip Hausa prefix (everything before " / ") for clean display
+            combined = combined.dropna().astype(str).str.split(" / ").str[-1].str.strip()
+            counts = combined.value_counts().reset_index()
+            counts.columns = ["response", "count"]
+            counts["group"] = label
+            resp_rows.append(counts)
+
+    if resp_rows:
+        save(pd.concat(resp_rows, ignore_index=True),
+             os.path.join(APP_DATA_DIR, "access_stockout_responses.csv"),
+             "stockout responses")
+
+    # ── 3. Travel times and gap ───────────────────────────────────────────────
+    travel_rows = []
+
+    for split_col in SPLIT_COLS:
+        # Mean travel time users
+        if "travel_time_users" in users.columns:
+            s = split_weighted_mean(users, "travel_time_users", split_col)
+            for grp, val in s.items():
+                travel_rows.append({"metric": "mean_travel_users", "split": split_col,
+                                    "group": grp, "value": val})
+
+        # Mean travel time nonusers
+        if "travel_time_nonusers" in nonusers.columns:
+            s = split_weighted_mean(nonusers, "travel_time_nonusers", split_col)
+            for grp, val in s.items():
+                travel_rows.append({"metric": "mean_travel_nonusers", "split": split_col,
+                                    "group": grp, "value": val})
+
+        # Travel gap rate (users)
+        if "travel_time_users" in users.columns and "wtt_minutes" in df.columns:
+            users_wtt = users.join(df[["wtt_minutes"]], how="left", rsuffix="_df")
+            users_wtt["_gap"] = (users_wtt["travel_time_users"] - users_wtt["wtt_minutes"]).gt(0).fillna(False)
+            s = split_weighted_prop(users_wtt, "_gap", split_col)
+            for grp, val in s.items():
+                travel_rows.append({"metric": "travel_gap_rate", "split": split_col,
+                                    "group": grp, "value": val})
+
+    # Overall gap rate
+    if "travel_time_users" in users.columns and "wtt_minutes" in df.columns:
+        users_wtt = users.join(df[["wtt_minutes"]], how="left", rsuffix="_df")
+        users_wtt["_gap"] = (users_wtt["travel_time_users"] - users_wtt["wtt_minutes"]).gt(0).fillna(False)
+        overall = weighted_prop(users_wtt, "_gap")
+        travel_rows.append({"metric": "travel_gap_rate_overall", "split": "all",
+                            "group": "all", "value": overall})
+
+    # Transport mode value counts (qualitative, non-weighted)
+    for col, label in [("transport_mode_users", "users"), ("transport_mode_nonusers", "nonusers")]:
+        if col in df.columns:
+            subset = users if label == "users" else nonusers
+            # Strip Hausa prefix (e.g. "Tafiya / Walking" → "Walking")
+            clean = subset[col].dropna().astype(str).str.split(" / ").str[-1].str.strip()
+            counts = clean.value_counts(normalize=True).head(8).reset_index()
+            counts.columns = ["group", "value"]
+            counts["metric"] = f"transport_mode_{label}"
+            counts["split"] = "mode"
+            travel_rows.extend(counts.to_dict("records"))
+
+    save(pd.DataFrame(travel_rows), os.path.join(APP_DATA_DIR, "access_travel.csv"),
+         "travel metrics")
+
+    # ── 4. Affordability ──────────────────────────────────────────────────────
+    afford_rows = []
+
+    for split_col in SPLIT_COLS:
+        if "user_costs" in users.columns:
+            s = split_weighted_mean(users, "user_costs", split_col)
+            for grp, val in s.items():
+                afford_rows.append({"metric": "mean_cost_users", "split": split_col,
+                                    "group": grp, "value": val})
+        if "nonuser_cost" in nonusers.columns:
+            s = split_weighted_mean(nonusers, "nonuser_cost", split_col)
+            for grp, val in s.items():
+                afford_rows.append({"metric": "mean_cost_nonusers", "split": split_col,
+                                    "group": grp, "value": val})
+
+    # Share paying anything
+    if "user_costs" in users.columns:
+        users["_cost_barrier"] = users["user_costs"].gt(0).fillna(False)
+        overall_cost = weighted_prop(users, "_cost_barrier")
+        afford_rows.append({"metric": "cost_barrier_overall", "split": "all",
+                            "group": "all", "value": overall_cost})
+
+    save(pd.DataFrame(afford_rows), os.path.join(APP_DATA_DIR, "access_affordability.csv"),
+         "affordability metrics")
+
+    # ── 5. Composite barrier rates ────────────────────────────────────────────
+    df = df.copy()
+    if "willingness_to_travel" in df.columns:
+        df["wtt_minutes"] = df["willingness_to_travel"].map(WTT_MAP)
+
+    def _is_yes_series(series):
+        s = series.astype(str).str.strip()
+        return s.str.startswith("Ee") | s.str.lower().str.contains(r"\byes\b", regex=True)
+
+    df["supply_barrier"] = False
+    if "stockouts_users" in df.columns:
+        df["supply_barrier"] |= _is_yes_series(df["stockouts_users"])
+    if "stockouts_nonusers" in df.columns:
+        df["supply_barrier"] |= _is_yes_series(df["stockouts_nonusers"])
+
+    df["geo_barrier"] = False
+    if "travel_time_users" in df.columns and "wtt_minutes" in df.columns:
+        df["geo_barrier"] = (df["travel_time_users"] - df["wtt_minutes"]).gt(0).fillna(False)
+
+    df["cost_barrier"] = False
+    if "user_costs" in df.columns:
+        df["cost_barrier"] = df["user_costs"].gt(0).fillna(False)
+
+    df["any_barrier"] = df["supply_barrier"] | df["geo_barrier"] | df["cost_barrier"]
+
+    composite_rows = []
+    barriers = {
+        "Supply (stockout)": "supply_barrier",
+        "Geographic (travel gap)": "geo_barrier",
+        "Cost (paid > 0)": "cost_barrier",
+        "Any barrier": "any_barrier",
+    }
+    use_groups = ["user", "past_user", "future_user", "non_user", "all"]
+    for label, col in barriers.items():
+        for grp in use_groups:
+            sub = df if grp == "all" else df[df["use"] == grp]
+            val = weighted_prop(sub, col)
+            composite_rows.append({"barrier": label, "use_group": grp, "rate": val})
+
+    save(pd.DataFrame(composite_rows), os.path.join(APP_DATA_DIR, "access_composite.csv"),
+         "composite barriers")
+
+    print("  [access] done.")
