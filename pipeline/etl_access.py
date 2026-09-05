@@ -150,22 +150,35 @@ def run(df):
                 travel_rows.append({"metric": "mean_travel_nonusers", "split": split_col,
                                     "group": grp, "value": val})
 
-        # Travel gap rate (users)
-        if "travel_time_users" in users.columns and "wtt_minutes" in df.columns:
-            users_wtt = users.join(df[["wtt_minutes"]], how="left", rsuffix="_df")
-            users_wtt["_gap"] = (users_wtt["travel_time_users"] - users_wtt["wtt_minutes"]).gt(0).fillna(False)
-            s = split_weighted_prop(users_wtt, "_gap", split_col)
-            for grp, val in s.items():
-                travel_rows.append({"metric": "travel_gap_rate", "split": split_col,
-                                    "group": grp, "value": val})
+    # 2026-09-04: "Distance access gap" replaced, per the user's request (and
+    # matching the same change in Benin's pipeline), with two group-level
+    # averages instead of the users-only "% traveling farther than willing"
+    # rate -- (1) mean willingness-to-travel, current/past users vs.
+    # everyone else, and (2) mean reported/expected travel time, same two
+    # groups. Groups are fixed here (not one of SPLIT_COLS): "users" =
+    # current + past users (USER_GROUPS); "nonusers" = everyone else, i.e.
+    # NOT restricted to NONUSER_GROUPS -- future_user and any other/missing
+    # `use` value are folded in too, per the user's own framing ("nonusers:
+    # never users (everyone else)").
+    is_user = df["use"].isin(USER_GROUPS)
+    group_label = pd.Series(np.where(is_user, "Current/past users", "Non-users"), index=df.index)
 
-    # Overall gap rate
-    if "travel_time_users" in users.columns and "wtt_minutes" in df.columns:
-        users_wtt = users.join(df[["wtt_minutes"]], how="left", rsuffix="_df")
-        users_wtt["_gap"] = (users_wtt["travel_time_users"] - users_wtt["wtt_minutes"]).gt(0).fillna(False)
-        overall = weighted_prop(users_wtt, "_gap")
-        travel_rows.append({"metric": "travel_gap_rate_overall", "split": "all",
-                            "group": "all", "value": overall})
+    if "wtt_minutes" in df.columns:
+        tmp = df[["wtt_minutes"]].copy()
+        tmp[WEIGHT_COL] = df[WEIGHT_COL]
+        tmp["_group"] = group_label
+        s = split_weighted_mean(tmp, "wtt_minutes", "_group")
+        for grp, val in s.items():
+            travel_rows.append({"metric": "mean_wtt_by_group", "split": "use_binary",
+                                "group": grp, "value": val})
+
+    if "travel_time_users" in df.columns and "travel_time_nonusers" in df.columns:
+        combined_travel = df["travel_time_users"].where(is_user, df["travel_time_nonusers"])
+        tmp = pd.DataFrame({"_travel": combined_travel, WEIGHT_COL: df[WEIGHT_COL], "_group": group_label})
+        s = split_weighted_mean(tmp, "_travel", "_group")
+        for grp, val in s.items():
+            travel_rows.append({"metric": "mean_travel_by_group", "split": "use_binary",
+                                "group": grp, "value": val})
 
     # Transport mode value counts (qualitative, non-weighted)
     for col, label in [("transport_mode_users", "users"), ("transport_mode_nonusers", "nonusers")]:
