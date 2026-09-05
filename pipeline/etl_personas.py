@@ -11,19 +11,30 @@ Output files (by gender):
   personas_centroids_by_gender.csv — centroids per gender × cluster
   personas_profile_by_gender.csv   — profile per gender × cluster
   personas_elbow.csv               — within-cluster cost for k=1..6 per gender
+
+Output files (by FP-use status — same "user" definition as elsewhere in this
+pipeline, config.USER_GROUPS/NONUSER_GROUPS collapsing the 4-way `use` column
+into a binary Using FP / Not using FP):
+  personas_centroids_by_fp_use.csv — centroids per fp_use group × cluster
+  personas_profile_by_fp_use.csv   — profile per fp_use group × cluster
+  personas_elbow_by_fp_use.csv     — within-cluster cost for k=1..6 per fp_use group
 """
 
 import pandas as pd
 import numpy as np
 import os
 
-from pipeline.config import WEIGHT_COL, APP_DATA_DIR, VARS_FOR_CLUSTERING
+from pipeline.config import (
+    WEIGHT_COL, APP_DATA_DIR, VARS_FOR_CLUSTERING, USER_GROUPS, NONUSER_GROUPS,
+)
 from pipeline.utils import save
 
 N_CLUSTERS = 3
 K_MAX = 6  # maximum k to test for elbow plot
 
-# When clustering within a single gender, drop gender from features
+# When clustering within a single gender, drop gender from features (it's
+# constant within the group). Full VARS_FOR_CLUSTERING list is used for the
+# fp_use split instead, since gender still varies within each fp_use group.
 VARS_FOR_CLUSTERING_GENDER = [v for v in VARS_FOR_CLUSTERING if v != "gender"]
 
 GENDER_LABELS = {
@@ -31,13 +42,22 @@ GENDER_LABELS = {
     "male":   "Namiji / Homme",
 }
 
+FP_USE_LABELS = {
+    "user":     "Using FP",
+    "nonuser":  "Not using FP",
+}
 
-def _cluster_gender(df_gender, gender_label, KModes):
+
+def _cluster_group(df_group, group_label, group_col_name, cluster_vars, KModes):
     """
-    Run k-modes for k=1..K_MAX to collect elbow data, then fit the
-    final model with N_CLUSTERS.  Returns (centroids_df, profile_rows, elbow_rows).
+    Run k-modes for k=1..K_MAX to collect elbow data, then fit the final
+    model with N_CLUSTERS, on df_group using cluster_vars as features.
+    Every output row is tagged group_col_name -> group_label (e.g.
+    "gender" -> "Mace / Femme", or "fp_use" -> "Using FP") so callers can
+    concatenate results across groups and filter by the tag column.
+    Returns (centroids_df, profile_rows, elbow_rows).
     """
-    cluster_df = df_gender[VARS_FOR_CLUSTERING_GENDER].copy().fillna("Unknown")
+    cluster_df = df_group[cluster_vars].copy().fillna("Unknown")
     X = cluster_df.to_numpy()
 
     # ── Elbow data ────────────────────────────────────────────────────────────
@@ -46,7 +66,7 @@ def _cluster_gender(df_gender, gender_label, KModes):
         km = KModes(n_clusters=k, init="Cao" if k > 1 else "random",
                     n_init=3, verbose=0, random_state=42)
         km.fit(X)
-        elbow_rows.append({"gender": gender_label, "k": k, "cost": km.cost_})
+        elbow_rows.append({group_col_name: group_label, "k": k, "cost": km.cost_})
 
     # ── Final model ───────────────────────────────────────────────────────────
     km_final = KModes(n_clusters=N_CLUSTERS, init="Cao", n_init=5,
@@ -54,22 +74,21 @@ def _cluster_gender(df_gender, gender_label, KModes):
     clusters = km_final.fit_predict(X)
 
     # ── Centroids ─────────────────────────────────────────────────────────────
-    centroids = pd.DataFrame(km_final.cluster_centroids_,
-                             columns=VARS_FOR_CLUSTERING_GENDER)
-    centroids.insert(0, "gender", gender_label)
+    centroids = pd.DataFrame(km_final.cluster_centroids_, columns=cluster_vars)
+    centroids.insert(0, group_col_name, group_label)
     centroids.insert(1, "persona", range(N_CLUSTERS))
 
     counts = pd.Series(clusters).value_counts().sort_index()
     centroids["count"] = counts.values
 
-    if WEIGHT_COL in df_gender.columns:
-        df_c = df_gender.copy()
+    if WEIGHT_COL in df_group.columns:
+        df_c = df_group.copy()
         df_c["_cluster"] = clusters
         weighted_counts = df_c.groupby("_cluster")[WEIGHT_COL].sum()
         centroids["weighted_count"] = weighted_counts.values
 
     # ── Per-persona profile ───────────────────────────────────────────────────
-    df_c = df_gender.copy()
+    df_c = df_group.copy()
     df_c["_cluster"] = clusters
 
     profile_rows = []
@@ -78,10 +97,10 @@ def _cluster_gender(df_gender, gender_label, KModes):
         n = len(sub)
         w = sub[WEIGHT_COL].sum() if WEIGHT_COL in sub.columns else n
 
-        for col in VARS_FOR_CLUSTERING_GENDER:
+        for col in cluster_vars:
             if col == "age" and pd.api.types.is_numeric_dtype(sub[col]):
                 profile_rows.append({
-                    "gender": gender_label, "persona": persona_id,
+                    group_col_name: group_label, "persona": persona_id,
                     "variable": col, "value": "mean",
                     "proportion": sub[col].mean(),
                 })
@@ -89,28 +108,52 @@ def _cluster_gender(df_gender, gender_label, KModes):
                 vc = sub[col].value_counts(normalize=True).head(3)
                 for val, prop in vc.items():
                     profile_rows.append({
-                        "gender": gender_label, "persona": persona_id,
+                        group_col_name: group_label, "persona": persona_id,
                         "variable": col, "value": str(val),
                         "proportion": prop,
                     })
 
         # Additional demographic breakdown
         for col in ["gender", "age_group", "use"]:
-            if col in sub.columns and col not in VARS_FOR_CLUSTERING_GENDER:
+            if col in sub.columns and col not in cluster_vars:
                 vc = sub[col].value_counts(normalize=True)
                 for val, prop in vc.items():
                     profile_rows.append({
-                        "gender": gender_label, "persona": persona_id,
+                        group_col_name: group_label, "persona": persona_id,
                         "variable": col, "value": str(val),
                         "proportion": prop,
                     })
 
+        # "Other" life-goal free text (2026-09-04): "life_goals" clustering on
+        # its raw pipe-joined label text can land "Other" as a persona's modal
+        # value, which on its own tells you nothing about what respondents
+        # actually meant. Surface the top verbatim "Please specify" answers
+        # from anyone in this cluster who picked "Other", so the persona table
+        # isn't a dead end. Proportions are of respondents-who-specified, not
+        # of the whole cluster (n_specified below is the denominator).
+        if "life_goals_other_specify" in sub.columns:
+            specify = sub["life_goals_other_specify"].dropna().astype(str).str.strip()
+            specify = specify[specify != ""]
+            if not specify.empty:
+                vc = specify.value_counts(normalize=True).head(5)
+                for val, prop in vc.items():
+                    profile_rows.append({
+                        group_col_name: group_label, "persona": persona_id,
+                        "variable": "life_goals_other_specify", "value": val,
+                        "proportion": prop,
+                    })
+                profile_rows.append({
+                    group_col_name: group_label, "persona": persona_id,
+                    "variable": "_count", "value": "n_life_goals_specified",
+                    "proportion": len(specify),
+                })
+
         profile_rows.append({
-            "gender": gender_label, "persona": persona_id,
+            group_col_name: group_label, "persona": persona_id,
             "variable": "_count", "value": "n", "proportion": n,
         })
         profile_rows.append({
-            "gender": gender_label, "persona": persona_id,
+            group_col_name: group_label, "persona": persona_id,
             "variable": "_count", "value": "weighted_n", "proportion": w,
         })
 
@@ -167,6 +210,20 @@ def run(df):
                 for val, prop in vc.items():
                     profile_rows.append({"persona": persona_id, "variable": col,
                                          "value": str(val), "proportion": prop})
+        # "Other" life-goal free text — see _cluster_group's identical block
+        # for why this is needed (life_goals can cluster to "Other" alone).
+        if "life_goals_other_specify" in sub.columns:
+            specify = sub["life_goals_other_specify"].dropna().astype(str).str.strip()
+            specify = specify[specify != ""]
+            if not specify.empty:
+                vc = specify.value_counts(normalize=True).head(5)
+                for val, prop in vc.items():
+                    profile_rows.append({"persona": persona_id,
+                                         "variable": "life_goals_other_specify",
+                                         "value": val, "proportion": prop})
+                profile_rows.append({"persona": persona_id, "variable": "_count",
+                                      "value": "n_life_goals_specified",
+                                      "proportion": len(specify)})
         profile_rows.append({"persona": persona_id, "variable": "_count",
                               "value": "n", "proportion": n})
         profile_rows.append({"persona": persona_id, "variable": "_count",
@@ -189,7 +246,8 @@ def run(df):
                 print(f"  [personas] WARNING: no rows for gender='{gender_val}', skipping.")
                 continue
             print(f"  [personas] clustering {short_key} (n={len(df_g)})...")
-            c_df, p_rows, e_rows = _cluster_gender(df_g, gender_val, KModes)
+            c_df, p_rows, e_rows = _cluster_group(
+                df_g, gender_val, "gender", VARS_FOR_CLUSTERING_GENDER, KModes)
             all_centroids.append(c_df)
             all_profile_rows.extend(p_rows)
             all_elbow_rows.extend(e_rows)
@@ -205,4 +263,43 @@ def run(df):
              os.path.join(APP_DATA_DIR, "personas_elbow.csv"),
              "persona elbow data")
 
-    print(f"  [personas] done. {N_CLUSTERS} clusters per gender.")
+    # ── FP-use-split clustering ───────────────────────────────────────────────
+    # Same binary Using FP / Not using FP definition used throughout this
+    # pipeline (config.USER_GROUPS / NONUSER_GROUPS collapsing the 4-way
+    # `use` column: user+past_user -> Using FP, nonuser+future_user -> Not
+    # using FP). Clusters on the full VARS_FOR_CLUSTERING (gender included —
+    # it still varies within an fp_use group, unlike within a gender group).
+    fp_centroids, fp_profile_rows, fp_elbow_rows = [], [], []
+
+    use_col = "use"
+    if use_col not in df.columns:
+        print("  [personas] WARNING: 'use' column not found — skipping fp_use split.")
+    else:
+        fp_use_group = df[use_col].apply(
+            lambda v: "Using FP" if v in USER_GROUPS
+            else ("Not using FP" if v in NONUSER_GROUPS else None)
+        )
+        for fp_label in ["Using FP", "Not using FP"]:
+            df_g = df[fp_use_group == fp_label].copy()
+            if df_g.empty:
+                print(f"  [personas] WARNING: no rows for fp_use='{fp_label}', skipping.")
+                continue
+            print(f"  [personas] clustering fp_use={fp_label} (n={len(df_g)})...")
+            c_df, p_rows, e_rows = _cluster_group(
+                df_g, fp_label, "fp_use", VARS_FOR_CLUSTERING, KModes)
+            fp_centroids.append(c_df)
+            fp_profile_rows.extend(p_rows)
+            fp_elbow_rows.extend(e_rows)
+
+    if fp_centroids:
+        save(pd.concat(fp_centroids, ignore_index=True),
+             os.path.join(APP_DATA_DIR, "personas_centroids_by_fp_use.csv"),
+             "persona centroids (by fp_use)")
+        save(pd.DataFrame(fp_profile_rows),
+             os.path.join(APP_DATA_DIR, "personas_profile_by_fp_use.csv"),
+             "persona profiles (by fp_use)")
+        save(pd.DataFrame(fp_elbow_rows),
+             os.path.join(APP_DATA_DIR, "personas_elbow_by_fp_use.csv"),
+             "persona elbow data (by fp_use)")
+
+    print(f"  [personas] done. {N_CLUSTERS} clusters per gender and per fp_use group.")
