@@ -34,6 +34,7 @@ Output files (standalone culture-clustering, 2026-09-02):
 import pandas as pd
 import numpy as np
 import os
+import re
 
 from pipeline.config import (
     WEIGHT_COL, APP_DATA_DIR, VARS_FOR_CLUSTERING, CULTURE_CLUSTERING_VARS,
@@ -57,6 +58,38 @@ GENDER_LABELS = {
 
 # ── Feature engineering ──────────────────────────────────────────────────────
 
+# 2026-09-04: Fon uses IPA Extensions letters (ɖ, ɔ, ɛ, ɥ, ...) that never
+# appear in French, so the true French/Fon boundary is the LAST '/' before
+# the first such character -- not simply the first '/' in the string. Some
+# choice labels' French half contains its own slash (e.g. life_goals value 6,
+# "Une bonne/meilleure santé personnelle/ Lanmɛ ɖagbe/..."), and naively
+# splitting on the first '/' truncated those to "Une bonne", silently
+# dropping the rest of that item and anything pipe-joined after it -- caught
+# from a persona table showing "...|Une bonne" as a supposedly complete
+# top_driver value. Same fix needed in page_personas.py's _strip_hausa
+# (which is what actually renders life_goals/top_driver/top_barrier); the
+# copies in etl_family_planning.py and page_drivers_barriers.py carry the
+# same naive split and may have the same latent bug on other choice lists.
+_FON_CHAR_RE = re.compile(r"[ɐ-ʯ]")
+
+
+def _split_french_fon(item):
+    """French half of ONE bilingual 'French/Fon' label (already pipe-split)."""
+    m = _FON_CHAR_RE.search(item)
+    if not m:
+        # No Fon-specific character found -- fall back to the old behavior
+        # rather than guess.
+        if "/" in item:
+            french = item.split("/", 1)[0].strip()
+            return french if french else item.strip()
+        return item.strip()
+    boundary = item.rfind("/", 0, m.start())
+    if boundary == -1:
+        return item.strip()
+    french = item[:boundary].strip()
+    return french if french else item.strip()
+
+
 def _strip_fon(text):
     """French half of a bilingual 'French/Fon' label; handles pipe-delimited
     multi-select values. Same convention as etl_family_planning.py's
@@ -68,10 +101,9 @@ def _strip_fon(text):
         parts = [_strip_fon(p) for p in text.split("|")]
         parts = [p for p in parts if pd.notna(p) and p != ""]
         return "|".join(parts) if parts else np.nan
-    if "/" in text:
-        french = text.split("/", 1)[0].strip()
-        return french if french else np.nan
-    return text if text else np.nan
+    if not text:
+        return np.nan
+    return _split_french_fon(text) or np.nan
 
 
 def _first_value(text):
@@ -84,6 +116,26 @@ def _first_value(text):
     if pd.isna(text):
         return np.nan
     return str(text).split("|")[0].strip()
+
+
+# 2026-09-04: choice value -22 ("Autres raisons non mentionnées ici, Veuillez
+# préciser") is the catch-all "other" option on both the drivers and barriers
+# lists. Left unhandled, every respondent who picked it collapses into that
+# one generic placeholder label -- which can outrank every real category and
+# show up as a persona's "top barrier"/"top driver", discarding the actual
+# write-in the respondent gave. Swapped in from reason_*_main_other whenever
+# the top choice is that placeholder.
+_OTHER_LABEL_FR = "autres raisons non mentionnées ici, veuillez préciser"
+
+
+def _substitute_other(top: pd.Series, other_text: pd.Series) -> pd.Series:
+    is_other = top.apply(
+        lambda v: isinstance(v, str) and v.strip().casefold().rstrip(".") == _OTHER_LABEL_FR
+    )
+    other_text = other_text.apply(
+        lambda v: v.strip() if isinstance(v, str) and v.strip() else np.nan
+    )
+    return top.mask(is_other & other_text.notna(), other_text)
 
 
 def add_engineered_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -111,12 +163,22 @@ def add_engineered_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if "reason_use_main" in df.columns:
         df["top_driver"] = df["reason_use_main"].apply(_strip_fon).apply(_first_value)
+        if "reason_use_main_other" in df.columns:
+            df["top_driver"] = _substitute_other(df["top_driver"], df["reason_use_main_other"])
+        else:
+            print("  [personas] WARNING: 'reason_use_main_other' column not found — "
+                  "'other' write-ins for top_driver not substituted.")
     else:
         print("  [personas] WARNING: 'reason_use_main' column not found — 'top_driver' unavailable.")
         df["top_driver"] = np.nan
 
     if "reason_nonuse_main" in df.columns:
         df["top_barrier"] = df["reason_nonuse_main"].apply(_strip_fon).apply(_first_value)
+        if "reason_nonuse_main_other" in df.columns:
+            df["top_barrier"] = _substitute_other(df["top_barrier"], df["reason_nonuse_main_other"])
+        else:
+            print("  [personas] WARNING: 'reason_nonuse_main_other' column not found — "
+                  "'other' write-ins for top_barrier not substituted.")
     else:
         print("  [personas] WARNING: 'reason_nonuse_main' column not found — 'top_barrier' unavailable.")
         df["top_barrier"] = np.nan
